@@ -28,4 +28,5 @@ module spike_amm::oracle_library {
 
     (price0, price1, block_timestamp)
   }
+
 }
