@@ -107,6 +107,19 @@ module spike_amm::amm_pair {
       lp.locked = false;
   }
 
+    public(friend) fun lock_launchpad_pair(pair: &Object<Pair>) acquires Pair {
+        let lp = pair_data_mut(pair);
+        assert!(!lp.locked, error::invalid_state(ERROR_LOCKED));
+        lp.locked = true;
+    }
+
+    public(friend) fun unlock_launchpad_pair(pair: &Object<Pair>) acquires Pair {
+        let lp = pair_data_mut(pair);
+        assert!(lp.locked, error::invalid_state(ERROR_LOCKED)); 
+        lp.locked = false;
+    }
+
+
   fun assert_locked(pair: Object<Pair>) acquires Pair {
     let lp = pair_data(&pair);
     let locked = lp.locked;
@@ -341,6 +354,9 @@ module spike_amm::amm_pair {
 
     let pool = liquidity_pool(token0, token1);
     amm_controller::assert_unpaused();
+    let lp_data = pair_data(&pool);
+    assert!(!lp_data.locked, error::permission_denied(ERROR_LOCKED));
+
     let acc_store = token_utils::ensure_account_token_store(to, pool);
 
     let amount0 = fungible_asset::amount(&fungible_token0);
@@ -402,6 +418,8 @@ module spike_amm::amm_pair {
     amount: u64,
   ): (FungibleAsset, FungibleAsset) acquires Pair {
     amm_controller::assert_unpaused();
+    let lp_data = pair_data(&pair);
+    assert!(!lp_data.locked, error::permission_denied(ERROR_LOCKED));
     assert!(amount > 0, error::invalid_argument(ERROR_ZERO_AMOUNT));
     let sender_addr = signer::address_of(sender);
     let store = token_utils::ensure_account_token_store(sender_addr, pair);
@@ -463,7 +481,8 @@ module spike_amm::amm_pair {
     to: address,
   ): (FungibleAsset, FungibleAsset) acquires Pair {
     amm_controller::assert_unpaused();
-
+    let lp_data = pair_data(&pair);
+    assert!(!lp_data.locked, error::permission_denied(ERROR_LOCKED));
     let amount0_in = fungible_asset::amount(&token0_in);
     let amount1_in = fungible_asset::amount(&token1_in);
 
