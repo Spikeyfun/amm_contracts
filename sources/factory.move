@@ -15,12 +15,25 @@ module spike_amm::amm_factory {
 
   use razor_libs::sort;
 
+  friend spike_amm::amm_router;
+
+
   const ERROR_IDENTICAL_ADDRESSES: u64 = 1;
   const ERROR_PAIR_EXISTS: u64 = 2;
+  const ERROR_NOT_WHITELISTED: u64 = 3;
+  const ERROR_FORBIDDEN: u64 = 4;
+
+  const ERROR_LAUNCHPAD_NOT_INITIALIZED: u64 = 5;
+  const ERROR_LAUNCHPAD_ALREADY_INITIALIZED: u64 = 6;
 
   struct Factory has key {
     all_pairs: SmartVector<address>,
     pair_map: SimpleMap<vector<u8>, address>,
+  }
+
+  struct LaunchpadConfig has key {
+    creator_map: SimpleMap<address, address>,
+    whitelist: SimpleMap<address, bool>,
   }
 
   #[event]
@@ -69,6 +82,65 @@ module spike_amm::amm_factory {
       token0: object::object_address(&token0),
       token1: object::object_address(&token1),
     })
+  }
+
+  // New function to create a locked pair with launcher restrictions
+  public(friend) fun create_pair_locked(
+      sender: &signer,
+      tokenA: address,
+      tokenB: address,
+  ) acquires Factory, LaunchpadConfig {
+      let creator = signer::address_of(sender);
+      let launchpad_config_addr = amm_controller::get_signer_address();
+      assert!(exists<LaunchpadConfig>(launchpad_config_addr), error::invalid_state(ERROR_LAUNCHPAD_NOT_INITIALIZED));
+      let launchpad_config = safe_launchpad_config_mut();
+
+      assert!(simple_map::contains_key(&launchpad_config.whitelist, &creator), error::permission_denied(ERROR_NOT_WHITELISTED));
+      
+      let token0_object = object::address_to_object<Metadata>(tokenA);
+      let token1_object = object::address_to_object<Metadata>(tokenB);
+      assert!(tokenA != tokenB, error::invalid_argument(ERROR_IDENTICAL_ADDRESSES));
+      let (token0, token1) = sort::sort_two_tokens(token0_object, token1_object);
+      assert!(!pair_exists(token0, token1), error::invalid_state(ERROR_PAIR_EXISTS));
+      
+      let pair_object = amm_pair::initialize(token0, token1);
+      
+      amm_pair::lock_launchpad_pair(&pair_object);
+
+      let pair_address = object::object_address(&pair_object);
+      simple_map::add(&mut launchpad_config.creator_map, pair_address, creator);
+
+      let factory = safe_factory_mut();
+      smart_vector::push_back(&mut factory.all_pairs, pair_address);
+      let pair_seed = amm_pair::get_pair_seed(token0, token1);
+      simple_map::add(&mut factory.pair_map, pair_seed, pair_address);
+
+      event::emit(PairCreatedEvent {
+        pair: pair_address,
+        creator: creator,
+        token0: object::object_address(&token0),
+        token1: object::object_address(&token1),
+      })
+  }
+
+  public(friend) fun verify_and_unlock_pair(
+      creator_signer: &signer,
+      pair_address: address
+  ) acquires LaunchpadConfig {
+      let creator_address = signer::address_of(creator_signer);
+      assert!(exists<LaunchpadConfig>(amm_controller::get_signer_address()), error::invalid_state(ERROR_LAUNCHPAD_NOT_INITIALIZED));
+      let launchpad_config = safe_launchpad_config();
+
+      assert!(
+          simple_map::contains_key(&launchpad_config.creator_map, &pair_address),
+          error::permission_denied(ERROR_FORBIDDEN)
+      );
+
+      let original_creator = *simple_map::borrow(&launchpad_config.creator_map, &pair_address);
+      assert!(original_creator == creator_address, error::permission_denied(ERROR_FORBIDDEN));
+
+      let pair_object = object::address_to_object<Pair>(pair_address);
+      amm_pair::unlock_launchpad_pair(&pair_object);
   }
 
   #[view]
@@ -192,11 +264,67 @@ module spike_amm::amm_factory {
     amm_controller::claim_admin(account);
   }
 
+  //Launcher functions for managing the Launchpad feature
+
+public entry fun initialize_launchpad_feature(admin: &signer) {
+    assert!(signer::address_of(admin) == amm_controller::get_admin(), error::permission_denied(ERROR_FORBIDDEN));
+
+    let launchpad_config_addr = amm_controller::get_signer_address();
+    assert!(!exists<LaunchpadConfig>(launchpad_config_addr), error::invalid_state(ERROR_LAUNCHPAD_ALREADY_INITIALIZED));
+
+    let contract_signer = amm_controller::get_signer();
+    move_to(&contract_signer, LaunchpadConfig {
+        creator_map: simple_map::new(),
+        whitelist: simple_map::new(),
+    });
+}
+
+  public entry fun add_launcher_to_whitelist(admin: &signer, creator_to_add: address) acquires LaunchpadConfig {
+      assert!(signer::address_of(admin) == amm_controller::get_admin(), error::permission_denied(ERROR_FORBIDDEN));
+      assert!(exists<LaunchpadConfig>(amm_controller::get_signer_address()), error::invalid_state(ERROR_LAUNCHPAD_NOT_INITIALIZED));
+      let launchpad_config = safe_launchpad_config_mut();
+      simple_map::add(&mut launchpad_config.whitelist, creator_to_add, true);
+  }
+
+  public entry fun remove_launcher_from_whitelist(admin: &signer, creator_to_remove: address) acquires LaunchpadConfig {
+      assert!(signer::address_of(admin) == amm_controller::get_admin(), error::permission_denied(ERROR_FORBIDDEN));
+      assert!(exists<LaunchpadConfig>(amm_controller::get_signer_address()), error::invalid_state(ERROR_LAUNCHPAD_NOT_INITIALIZED));
+      let launchpad_config = safe_launchpad_config_mut();
+      simple_map::remove(&mut launchpad_config.whitelist, &creator_to_remove);
+  }
+
+  #[view]
+  public fun is_whitelisted(creator: address): bool acquires LaunchpadConfig {
+      if (!exists<LaunchpadConfig>(amm_controller::get_signer_address())) { return false };
+      let launchpad_config = safe_launchpad_config();
+      simple_map::contains_key(&launchpad_config.whitelist, &creator)
+  }
+
+  #[view]
+  public fun get_creator_for_pair(pair_address: address): address acquires LaunchpadConfig {
+      if (!exists<LaunchpadConfig>(amm_controller::get_signer_address())) { return @0x0 };
+      let launchpad_config = safe_launchpad_config();
+      if (!simple_map::contains_key(&launchpad_config.creator_map, &pair_address)) {
+          return @0x0
+      };
+      *simple_map::borrow(&launchpad_config.creator_map, &pair_address)
+  }
+
+  //end of launcher functions
+
   inline fun safe_factory(): &Factory acquires Factory {
     borrow_global<Factory>(@spike_amm)
   }
 
   inline fun safe_factory_mut(): &mut Factory acquires Factory {
     borrow_global_mut<Factory>(@spike_amm)
+  }
+
+    inline fun safe_launchpad_config(): &LaunchpadConfig acquires LaunchpadConfig {
+    borrow_global<LaunchpadConfig>(amm_controller::get_signer_address())
+  }
+
+  inline fun safe_launchpad_config_mut(): &mut LaunchpadConfig acquires LaunchpadConfig {
+    borrow_global_mut<LaunchpadConfig>(amm_controller::get_signer_address())
   }
 }
