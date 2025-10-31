@@ -692,8 +692,7 @@ module spike_staking::stake_fa {
         assert!(!is_emergency_inner(pool), error::invalid_state(ERR_EMERGENCY));
         assert!(!pool.stakes_closed, error::invalid_state(ERR_STAKES_ALREADY_CLOSED));
 
-        let user_primary_stake_store = primary_fungible_store::primary_store(user_addr, pool.stake_metadata);
-        let assets_to_deposit = fungible_asset::withdraw(user, user_primary_stake_store, stake_amount);
+        let assets_to_deposit = primary_fungible_store::withdraw(user, pool.stake_metadata, stake_amount);
 
         update_accum_reward(pool);
 
@@ -1887,4 +1886,3 @@ module spike_staking::stake_fa {
         assert!(signer::address_of(admin_signer) == admin_config.current_admin, error::permission_denied(ERR_NOT_AUTHORIZED));
     }
 }
-
