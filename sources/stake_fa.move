@@ -17,6 +17,7 @@ module spike_staking::stake_fa {
     use aptos_token::token::{Self, Token};
     use supra_framework::supra_coin::SupraCoin;
     use supra_framework::coin::{Self};
+    use supra_framework::dispatchable_fungible_asset;
     use spike_staking::stake_fa_config;
 
     // ===== INVALID_ARGUMENT =====
@@ -386,11 +387,7 @@ module spike_staking::stake_fa {
         assert!(reward_per_sec > 0, error::invalid_argument(ERR_REWARD_RATE_ZERO));
 
         let caller_primary_reward_store = primary_fungible_store::primary_store(caller_addr, reward_metadata);
-        let initial_reward_asset = fungible_asset::withdraw(
-            caller,
-            caller_primary_reward_store,
-            initial_reward_amount
-        );
+        let initial_reward_asset = internal_withdraw(caller, caller_primary_reward_store, initial_reward_amount);
 
         let current_time = timestamp::now_seconds();
         let end_timestamp = current_time + duration;
@@ -402,7 +399,7 @@ module spike_staking::stake_fa {
         let reward_store_obj_ref = object::create_object_from_account(&resource_signer);
         let pool_reward_store = fungible_asset::create_store(&reward_store_obj_ref, reward_metadata);
 
-        fungible_asset::deposit(pool_reward_store, initial_reward_asset);
+        internal_deposit(pool_reward_store, initial_reward_asset);
 
         let event_boost_owner_opt: Option<address> = option::none();
         let event_boost_name_opt: Option<String> = option::none();
@@ -625,11 +622,7 @@ module spike_staking::stake_fa {
         let depositor_addr = signer::address_of(depositor);
         let depositor_primary_store = primary_fungible_store::primary_store(depositor_addr, pool.reward_metadata);
 
-        let assets_to_deposit = fungible_asset::withdraw(
-            depositor, 
-            depositor_primary_store,
-            deposit_amount
-        );
+        let assets_to_deposit = internal_withdraw(depositor, depositor_primary_store, deposit_amount);
 
         // --- Recalculate reward_per_sec and end_timestamp ---
         // First, update the pool to account for rewards accrued until now
@@ -657,7 +650,7 @@ module spike_staking::stake_fa {
 
 
         // Merge the deposited assets
-        fungible_asset::deposit(pool.reward_store, assets_to_deposit);
+        internal_deposit(pool.reward_store, assets_to_deposit);
 
         event::emit_event<DepositRewardEvent>(
             &mut pool.deposit_events,
@@ -692,7 +685,8 @@ module spike_staking::stake_fa {
         assert!(!is_emergency_inner(pool), error::invalid_state(ERR_EMERGENCY));
         assert!(!pool.stakes_closed, error::invalid_state(ERR_STAKES_ALREADY_CLOSED));
 
-        let assets_to_deposit = primary_fungible_store::withdraw(user, pool.stake_metadata, stake_amount);
+        let user_primary_stake_store = primary_fungible_store::primary_store(user_addr, pool.stake_metadata);
+        let assets_to_deposit = internal_withdraw(user, user_primary_stake_store, stake_amount);
 
         update_accum_reward(pool);
 
@@ -742,7 +736,7 @@ module spike_staking::stake_fa {
             user_stake.reward_points_debt = pool.accum_reward * user_new_total_effective_stake;
         };
 
-        fungible_asset::deposit(pool.stake_store, assets_to_deposit);
+        internal_deposit(pool.stake_store, assets_to_deposit);
         event::emit_event<StakeEvent>(
             &mut pool.stake_events, StakeEvent { 
                 user_address: user_addr, 
@@ -812,7 +806,7 @@ module spike_staking::stake_fa {
         };
         user_stake.reward_points_debt = pool.accum_reward * user_new_total_effective_stake;
 
-        let withdrawn_assets_from_pool = fungible_asset::withdraw(&resource_signer, pool.stake_store, amount);
+        let withdrawn_assets_from_pool = internal_withdraw(&resource_signer, pool.stake_store, amount);
         event::emit_event<UnstakeEvent>(
             &mut pool.unstake_events, UnstakeEvent { 
                 user_address: user_addr, 
@@ -861,7 +855,7 @@ module spike_staking::stake_fa {
 
         user_stake.earned_reward = 0;
 
-        let withdrawn_rewards_from_pool = fungible_asset::withdraw(&resource_signer, pool.reward_store, amount_to_harvest);
+        let withdrawn_rewards_from_pool = internal_withdraw(&resource_signer, pool.reward_store, amount_to_harvest);
         event::emit_event<HarvestEvent>(
             &mut pool.harvest_events, HarvestEvent { 
                 user_address: user_addr, 
@@ -1012,12 +1006,8 @@ module spike_staking::stake_fa {
         assert!(pool.reward_per_sec > 0, error::invalid_argument(ERR_REWARD_RATE_ZERO));
 
         let caller_primary_reward_store = primary_fungible_store::primary_store(caller_addr, pool.reward_metadata);
-        let reward_assets_to_deposit = fungible_asset::withdraw(
-            caller_signer,
-            caller_primary_reward_store,
-            total_reward_amount
-        );
-        fungible_asset::deposit(pool.reward_store, reward_assets_to_deposit);
+        let reward_assets_to_deposit = internal_withdraw(caller_signer, caller_primary_reward_store, total_reward_amount);
+        internal_deposit(pool.reward_store, reward_assets_to_deposit);
 
         // Update accum_reward. Since last_updated was start_timestamp and reward_per_sec
         // was just defined, this will calculate the accum_reward for the entire period.
@@ -1112,11 +1102,7 @@ module spike_staking::stake_fa {
         };
 
         let maybe_withdrawn_fa: Option<FungibleAsset> = if (amount > 0) {
-            let withdrawn_stake_assets = fungible_asset::withdraw(
-                &resource_signer,
-                pool.stake_store,
-                amount
-            );
+            let withdrawn_stake_assets = internal_withdraw(&resource_signer, pool.stake_store, amount);
             option::some(withdrawn_stake_assets)
         } else {
             option::none()
@@ -1162,11 +1148,7 @@ module spike_staking::stake_fa {
             assert!(timestamp::now_seconds() >= withdraw_allowed_after, error::invalid_state(ERR_NOT_WITHDRAW_PERIOD));
         };
 
-        let withdrawn_reward_assets = fungible_asset::withdraw(
-            &resource_signer,
-            pool.reward_store,
-            amount
-        );
+        let withdrawn_reward_assets = internal_withdraw(&resource_signer, pool.reward_store, amount);
 
         event::emit_event<TreasuryWithdrawalEvent>(
             &mut pool.treasury_withdrawal_event,
@@ -1450,10 +1432,10 @@ module spike_staking::stake_fa {
             reward_addr
         );
         let resource_addr = get_module_resource_address();
-        let pools_manager = borrow_global<PoolsManager>(resource_addr);
         if (!exists<PoolsManager>(resource_addr)) {
             return false
         };
+        let pools_manager = borrow_global<PoolsManager>(resource_addr);
         if (!table::contains(&pools_manager.pools, pool_key)) {
             return false
         };
@@ -1884,5 +1866,20 @@ module spike_staking::stake_fa {
         let resource_addr = borrow_global<ModuleSignerStorage>(module_admin_account_addr).resource_address;
         let admin_config = borrow_global<AdminConfig>(resource_addr);
         assert!(signer::address_of(admin_signer) == admin_config.current_admin, error::permission_denied(ERR_NOT_AUTHORIZED));
+    }
+
+    fun internal_withdraw(
+        signer: &signer,
+        store: Object<FungibleStore>,
+        amount: u64
+    ): FungibleAsset {
+        dispatchable_fungible_asset::withdraw(signer, store, amount)
+    }
+
+    fun internal_deposit(
+        store: Object<FungibleStore>,
+        asset: FungibleAsset
+    ) {
+        dispatchable_fungible_asset::deposit(store, asset)
     }
 }
