@@ -69,6 +69,8 @@ module spike_staking::stake_fa {
     const ERR_MUL_OVERFLOW_IN_ACCUM_REWARD_UPDATE: u64 = 73;
     const ERR_ACCUM_REWARD_ADD_OVERFLOW: u64 = 74;        
     const ERR_REWARD_DEBT_CALC_OVERFLOW: u64 = 75;
+    const ERR_STAKE_BELOW_MINIMUM: u64 = 76;
+
 
     // ===== ADMIN =====
     const ERR_NO_PENDING_ADMIN_TRANSFER: u64 = 81;
@@ -383,7 +385,11 @@ module spike_staking::stake_fa {
         let stake_metadata: Object<Metadata> = object::address_to_object<Metadata>(stake_addr);
         let reward_metadata: Object<Metadata> = object::address_to_object<Metadata>(reward_addr);
 
-        let reward_per_sec = (initial_reward_amount as u128) * ACCUM_REWARD_SCALE / (duration as u128);
+        let reward_amount_u256 = (initial_reward_amount as u256);
+        let duration_u256 = (duration as u256);
+        let scale_u256 = (ACCUM_REWARD_SCALE as u256);
+        let reward_per_sec_val = (reward_amount_u256 * scale_u256) / duration_u256;
+        let reward_per_sec = (reward_per_sec_val as u128);
         assert!(reward_per_sec > 0, error::invalid_argument(ERR_REWARD_RATE_ZERO));
 
         let caller_primary_reward_store = primary_fungible_store::primary_store(caller_addr, reward_metadata);
@@ -681,6 +687,7 @@ module spike_staking::stake_fa {
         let pools_manager = borrow_global_mut<PoolsManager>(resource_addr);
         assert!(table::contains(&pools_manager.pools, pool_key), error::not_found(ERR_NO_POOL));
         let pool = table::borrow_mut(&mut pools_manager.pools, pool_key);
+        let min_stake = get_min_stake_required(pool.stake_metadata);
 
         assert!(!is_emergency_inner(pool), error::invalid_state(ERR_EMERGENCY));
         assert!(!pool.stakes_closed, error::invalid_state(ERR_STAKES_ALREADY_CLOSED));
@@ -698,6 +705,7 @@ module spike_staking::stake_fa {
         };
 
         if (!table::contains(&pool.stakes, user_addr)) {
+            assert!(stake_amount >= min_stake, error::invalid_argument(ERR_STAKE_BELOW_MINIMUM));
             let user_effective_stake_after_new_deposit = (stake_amount as u128);
 
             assert!(pool.accum_reward == 0 || user_effective_stake_after_new_deposit <= MAX_U128 / pool.accum_reward, error::out_of_range(ERR_REWARD_DEBT_CALC_OVERFLOW));
@@ -719,6 +727,7 @@ module spike_staking::stake_fa {
             update_user_reward_state(pool.accum_reward, user_stake);
 
             user_stake.amount = user_stake.amount + stake_amount;
+            assert!(user_stake.amount >= min_stake, error::invalid_argument(ERR_STAKE_BELOW_MINIMUM));
             user_stake.unlock_time = current_time + lockup_duration;
 
             if (option::is_some(&user_stake.nft)) {
@@ -764,6 +773,7 @@ module spike_staking::stake_fa {
         let pools_manager = borrow_global_mut<PoolsManager>(resource_addr);
         assert!(table::contains(&pools_manager.pools, pool_key), error::not_found(ERR_NO_POOL));
         let pool = table::borrow_mut(&mut pools_manager.pools, pool_key);
+        let min_stake = get_min_stake_required(pool.stake_metadata);
 
         assert!(!is_emergency_inner(pool), error::invalid_state(ERR_EMERGENCY));
         assert!(table::contains(&pool.stakes, user_addr), error::not_found(ERR_NO_STAKE));
@@ -784,6 +794,10 @@ module spike_staking::stake_fa {
         let old_boosted_amount = user_stake.boosted_amount;
         user_stake.amount = user_stake.amount - amount;
 
+        assert!(
+            user_stake.amount == 0 || user_stake.amount >= min_stake, 
+            error::invalid_state(ERR_STAKE_BELOW_MINIMUM)
+        );
         if (option::is_some(&user_stake.nft)) {
             assert!(option::is_some(&pool.nft_boost_config), error::invalid_state(ERR_NON_BOOST_POOL));
             let boost_config_val = option::borrow(&pool.nft_boost_config);
@@ -1881,5 +1895,15 @@ module spike_staking::stake_fa {
         asset: FungibleAsset
     ) {
         dispatchable_fungible_asset::deposit(store, asset)
+    }
+
+    fun get_min_stake_required(stake_metadata: Object<Metadata>): u64 {
+        let decimals = fungible_asset::decimals(stake_metadata);
+        
+        if (decimals >= 12) {
+             1000000 
+        } else {
+             1000 
+        }
     }
 }
