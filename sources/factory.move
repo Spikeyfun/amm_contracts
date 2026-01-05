@@ -13,6 +13,9 @@ module spike_amm::amm_factory {
   use spike_amm::amm_controller;
   use spike_amm::amm_pair::{Self, Pair};
 
+  use supra_framework::coin;
+  use spike_amm::coin_wrapper;
+
   use razor_libs::sort;
 
   friend spike_amm::amm_router;
@@ -22,6 +25,7 @@ module spike_amm::amm_factory {
   const ERROR_PAIR_EXISTS: u64 = 2;
   const ERROR_NOT_WHITELISTED: u64 = 3;
   const ERROR_FORBIDDEN: u64 = 4;
+  const ERROR_USE_COIN_GATEWAY: u64 = 7;
 
   const ERROR_LAUNCHPAD_NOT_INITIALIZED: u64 = 5;
   const ERROR_LAUNCHPAD_ALREADY_INITIALIZED: u64 = 6;
@@ -56,29 +60,63 @@ module spike_amm::amm_factory {
     exists<Factory>(@spike_amm)
   }
 
+  public fun assert_is_pure_native_fa(token_addr: address) {
+    let metadata_obj = supra_framework::object::address_to_object<Metadata>(token_addr);
+    
+    assert!(
+        std::option::is_none(&coin::paired_coin(metadata_obj)),
+        std::error::invalid_argument(ERROR_USE_COIN_GATEWAY)
+    );
+
+    assert!(
+        !coin_wrapper::is_wrapper(metadata_obj),
+        std::error::invalid_argument(ERROR_USE_COIN_GATEWAY)
+    );
+  }
+
   public entry fun create_pair(
+    sender: &signer,
+    tokenA: address,
+    tokenB: address,
+  ) acquires Factory {
+    assert_is_pure_native_fa(tokenA);
+    assert_is_pure_native_fa(tokenB);
+
+    create_pair_internal(sender, tokenA, tokenB);
+  }
+
+  public(friend) fun create_pair_from_router(
+    sender: &signer,
+    tokenA: address,
+    tokenB: address,
+  ) acquires Factory {
+    create_pair_internal(sender, tokenA, tokenB);
+  }
+
+  fun create_pair_internal(
     sender: &signer,
     tokenA: address,
     tokenB: address,
   ) acquires Factory {
     let token0_object = object::address_to_object<Metadata>(tokenA);
     let token1_object = object::address_to_object<Metadata>(tokenB);
+    
     assert!(tokenA != tokenB, error::invalid_argument(ERROR_IDENTICAL_ADDRESSES));
+    
     let (token0, token1) = sort::sort_two_tokens(token0_object, token1_object);
     assert!(pair_exists(token0, token1) == false, error::invalid_state(ERROR_PAIR_EXISTS));
+    
     let pair = amm_pair::initialize(token0, token1);
     let pair_address = object::object_address(&pair);
     let pair_seed = amm_pair::get_pair_seed(token0, token1);
+    
     let factory = safe_factory_mut();
     smart_vector::push_back(&mut factory.all_pairs, pair_address);
     simple_map::add(&mut factory.pair_map, pair_seed, pair_address);
 
-
-    let creator = signer::address_of(sender);
-
     event::emit(PairCreatedEvent {
       pair: pair_address,
-      creator: creator,
+      creator: signer::address_of(sender),
       token0: object::object_address(&token0),
       token1: object::object_address(&token1),
     })
@@ -93,34 +131,21 @@ module spike_amm::amm_factory {
       let creator = signer::address_of(sender);
       let launchpad_config_addr = amm_controller::get_signer_address();
       assert!(exists<LaunchpadConfig>(launchpad_config_addr), error::invalid_state(ERROR_LAUNCHPAD_NOT_INITIALIZED));
+      
       let launchpad_config = safe_launchpad_config_mut();
-
       assert!(simple_map::contains_key(&launchpad_config.whitelist, &creator), error::permission_denied(ERROR_NOT_WHITELISTED));
       
+      create_pair_internal(sender, tokenA, tokenB);
+
       let token0_object = object::address_to_object<Metadata>(tokenA);
       let token1_object = object::address_to_object<Metadata>(tokenB);
-      assert!(tokenA != tokenB, error::invalid_argument(ERROR_IDENTICAL_ADDRESSES));
       let (token0, token1) = sort::sort_two_tokens(token0_object, token1_object);
-      assert!(!pair_exists(token0, token1), error::invalid_state(ERROR_PAIR_EXISTS));
       
-      let pair_object = amm_pair::initialize(token0, token1);
-      
+      let pair_object = amm_pair::liquidity_pool(token0, token1);
       amm_pair::lock_launchpad_pair(&pair_object);
 
       let pair_address = object::object_address(&pair_object);
       simple_map::add(&mut launchpad_config.creator_map, pair_address, creator);
-
-      let factory = safe_factory_mut();
-      smart_vector::push_back(&mut factory.all_pairs, pair_address);
-      let pair_seed = amm_pair::get_pair_seed(token0, token1);
-      simple_map::add(&mut factory.pair_map, pair_seed, pair_address);
-
-      event::emit(PairCreatedEvent {
-        pair: pair_address,
-        creator: creator,
-        token0: object::object_address(&token0),
-        token1: object::object_address(&token1),
-      })
   }
 
   public(friend) fun verify_and_unlock_pair(
@@ -244,6 +269,10 @@ module spike_amm::amm_factory {
     amm_controller::set_swap_fee(account, swap_fee);
   }
 
+  public entry fun set_flash_loan_fee(account: &signer, new_fee_bps: u64) {
+    amm_controller::set_flash_loan_fee(account, new_fee_bps);
+  }
+  
   public entry fun pause(account: &signer) {
     amm_controller::pause(account);
   }
