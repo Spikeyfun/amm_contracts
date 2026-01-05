@@ -34,12 +34,20 @@ module spike_amm::amm_pair {
   const ERROR_INSUFFICIENT_LIQUIDITY_MINT: u64 = 22;
   const ERROR_INSUFFICIENT_LIQUIDITY_BURN: u64 = 23;
   const ERROR_K_ERROR: u64 = 24;
-
+  const ERROR_INVALID_TOKEN: u64 = 25;
+  const ERROR_INSUFFICIENT_REPAYMENT: u64 = 26;
+  const ERROR_WRONG_TOKEN: u64 = 27;
   
   struct LPTokenRefs has store {
     burn_ref: BurnRef,
     mint_ref: MintRef,
     transfer_ref: TransferRef,
+  }
+
+  struct FlashLoanReceipt {
+    amount_loaned: u64,
+    fee: u64,
+    token_borrowed: Object<Metadata>
   }
 
   #[resource_group_member(group = supra_framework::object::ObjectGroup)]
@@ -98,6 +106,14 @@ module spike_amm::amm_pair {
     pair_address: address,
   }
 
+  #[event]
+  struct FlashLoanEvent has drop, store {
+      borrower: address,
+      token: address,
+      amount: u64,
+      fee_amount: u64
+  }
+
   inline fun lock_pair(lp: &mut Pair) {
     assert!(lp.locked == false, error::permission_denied(ERROR_LOCKED));
     lp.locked = true;
@@ -107,18 +123,92 @@ module spike_amm::amm_pair {
       lp.locked = false;
   }
 
-    public(friend) fun lock_launchpad_pair(pair: &Object<Pair>) acquires Pair {
-        let lp = pair_data_mut(pair);
-        assert!(!lp.locked, error::invalid_state(ERROR_LOCKED));
-        lp.locked = true;
-    }
+  public(friend) fun lock_launchpad_pair(pair: &Object<Pair>) acquires Pair {
+      let lp = pair_data_mut(pair);
+      assert!(!lp.locked, error::invalid_state(ERROR_LOCKED));
+      lp.locked = true;
+  }
 
-    public(friend) fun unlock_launchpad_pair(pair: &Object<Pair>) acquires Pair {
-        let lp = pair_data_mut(pair);
-        assert!(lp.locked, error::invalid_state(ERROR_LOCKED)); 
-        lp.locked = false;
-    }
+  public(friend) fun unlock_launchpad_pair(pair: &Object<Pair>) acquires Pair {
+      let lp = pair_data_mut(pair);
+      assert!(lp.locked, error::invalid_state(ERROR_LOCKED)); 
+      lp.locked = false;
+  }
 
+  public fun flash_loan(
+      pair: Object<Pair>,
+      token_to_borrow: Object<Metadata>,
+      amount: u64
+  ): (FungibleAsset, FlashLoanReceipt) acquires Pair {
+      amm_controller::assert_unpaused();
+      let lp_data = pair_data(&pair);
+      assert!(!lp_data.locked, error::permission_denied(ERROR_LOCKED));
+      
+      let token0 = fungible_asset::store_metadata(lp_data.token0);
+      let token1 = fungible_asset::store_metadata(lp_data.token1);
+
+      assert!(
+          token_to_borrow == token0 || token_to_borrow == token1, 
+          error::invalid_argument(ERROR_INVALID_TOKEN)
+      );
+
+      let bps = amm_controller::get_flash_loan_fee_bps(); 
+      let fee = (amount * bps) / 10000;
+      
+      let store_to_withdraw_from = if (token_to_borrow == token0) {
+          lp_data.token0
+      } else {
+          lp_data.token1
+      };
+
+      let swap_signer = &amm_controller::get_signer();
+      let loan_asset = dispatchable_fungible_asset::withdraw(swap_signer, store_to_withdraw_from, amount);
+
+      let receipt = FlashLoanReceipt {
+          amount_loaned: amount,
+          fee,
+          token_borrowed: token_to_borrow
+      };
+
+      event::emit(FlashLoanEvent {
+          borrower: std::signer::address_of(&amm_controller::get_signer()),
+          token: object::object_address(&token_to_borrow),
+          amount,
+          fee_amount: fee
+      });
+
+      (loan_asset, receipt)
+  }
+
+  public fun repay_flash_loan(
+      pair: Object<Pair>,
+      payment: FungibleAsset,
+      receipt: FlashLoanReceipt
+  ) acquires Pair {
+      let FlashLoanReceipt { amount_loaned, fee, token_borrowed } = receipt;
+
+      let payment_amount = fungible_asset::amount(&payment);
+      let required_amount = amount_loaned + fee;
+
+      assert!(payment_amount >= required_amount, error::invalid_argument(ERROR_INSUFFICIENT_REPAYMENT));
+      assert!(fungible_asset::asset_metadata(&payment) == token_borrowed, error::invalid_argument(ERROR_WRONG_TOKEN));
+
+      let lp = pair_data_mut(&pair);
+      
+      let token0 = fungible_asset::store_metadata(lp.token0);
+      let store_to_deposit = if (token_borrowed == token0) {
+          lp.token0
+      } else {
+          lp.token1
+      };
+
+      dispatchable_fungible_asset::deposit(store_to_deposit, payment);
+
+      let balance0 = fungible_asset::balance(lp.token0);
+      let balance1 = fungible_asset::balance(lp.token1);
+      
+      update(lp, balance0, balance1, balance0, balance1);
+  }
 
   fun assert_locked(pair: Object<Pair>) acquires Pair {
     let lp = pair_data(&pair);
