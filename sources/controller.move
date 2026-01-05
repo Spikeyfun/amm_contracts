@@ -6,7 +6,8 @@ module spike_amm::amm_controller {
   friend spike_amm::amm_factory;
   friend spike_amm::amm_pair;
   friend spike_amm::amm_oracle;
-
+  friend spike_amm::coin_wrapper;
+  
   const FEE_ADMIN: address = @fee_admin;
   const ADMIN: address = @admin;
 
@@ -16,6 +17,7 @@ module spike_amm::amm_controller {
   const ERROR_NO_PENDING_ADMIN: u64 = 4;
   const ERROR_INVALID_ADDRESS: u64 = 5;
   const ERROR_PENDING_ADMIN_EXISTS: u64 = 6;
+  const ERROR_FEE_TOO_HIGH: u64 = 7;
 
   struct SwapConfig has key {
     extend_ref: ExtendRef,
@@ -25,6 +27,10 @@ module spike_amm::amm_controller {
     fee_on: bool,
     paused: bool,
     swap_fee: u8
+  }
+
+  struct FlashLoanConfig has key {
+    fee_bps: u64,
   }
 
   fun init_module(deployer: &signer) {
@@ -72,12 +78,39 @@ module spike_amm::amm_controller {
     safe_swap_config().fee_on
   }
 
+  #[view]
+  public fun get_flash_loan_fee_bps(): u64 acquires FlashLoanConfig {
+    if (exists<FlashLoanConfig>(@spike_amm)) {
+        borrow_global<FlashLoanConfig>(@spike_amm).fee_bps
+    } else {
+        5
+    }
+}
+
   public fun assert_paused() acquires SwapConfig {
   assert!(safe_swap_config().paused == true, error::invalid_state(ERROR_UNPAUSED));
   }
 
   public fun assert_unpaused() acquires SwapConfig {
     assert!(safe_swap_config().paused == false, error::invalid_state(ERROR_PAUSED));
+  }
+
+  public(friend) fun set_flash_loan_fee(
+    account: &signer,
+    new_fee_bps: u64
+  ) acquires FlashLoanConfig, SwapConfig {
+      let current_admin = safe_swap_config().current_admin;
+      assert!(signer::address_of(account) == current_admin, error::permission_denied(ERROR_FORBIDDEN));
+      
+      assert!(new_fee_bps <= 1000, error::invalid_argument(ERROR_FEE_TOO_HIGH));
+
+      if (exists<FlashLoanConfig>(@spike_amm)) {
+          let config = borrow_global_mut<FlashLoanConfig>(@spike_amm);
+          config.fee_bps = new_fee_bps;
+      } else {
+            let contract_signer = get_signer(); 
+            move_to(&contract_signer, FlashLoanConfig { fee_bps: new_fee_bps });
+      }
   }
 
   public(friend) fun pause(account: &signer) acquires SwapConfig {
