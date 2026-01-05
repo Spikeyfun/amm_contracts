@@ -7,18 +7,29 @@ module spike_amm::coin_wrapper {
     use supra_framework::object::{Self, Object};
     use supra_framework::primary_fungible_store;
     use supra_framework::supra_coin::SupraCoin;
+    use supra_framework::event;
+
     use aptos_std::smart_table::{Self, SmartTable};
     use aptos_std::string_utils;
     use aptos_std::type_info;
     use std::string::{Self, String};
     use std::option;
     use std::signer;
+    use std::error;
     use spike_amm::package_manager;
+    use spike_amm::amm_controller;
 
     friend spike_amm::amm_router;
     friend spike_amm::router_stake;
+    friend spike_amm::amm_factory;
+    friend spike_amm::flash_loan_router; 
 
     const COIN_WRAPPER_NAME: vector<u8> = b"COIN_YEET_FUNGIBLE";
+
+    const ERROR_INSUFFICIENT_AMOUNT: u64 = 901;
+    const ERROR_INVALID_REPAYMENT: u64 = 902;
+    const ERROR_NOT_ADMIN: u64 = 903;
+    const FLASH_LOAN_FEE_BPS: u64 = 5;
 
     struct FungibleAssetData has store {
         burn_ref: BurnRef,
@@ -31,6 +42,18 @@ module spike_amm::coin_wrapper {
         signer_cap: SignerCapability,
         coin_to_fungible_asset: SmartTable<String, FungibleAssetData>,
         fungible_asset_to_coin: SmartTable<Object<Metadata>, String>,
+    }
+
+    struct FlashLoanReceipt<phantom CoinType> {
+        amount: u64,
+        fee: u64
+    }
+
+    #[event]
+    struct FlashLoanEvent has drop, store {
+        amount: u64,
+        fee_amount: u64,
+        coin_type: String
     }
 
     fun init_module(swap_signer: &signer) acquires WrapperAccount {
@@ -46,6 +69,34 @@ module spike_amm::coin_wrapper {
             fungible_asset_to_coin: smart_table::new(),
         });
         create_fungible_asset<SupraCoin>();
+    }
+
+    fun get_wrapper_by_name_internal(coin_type_name: String): option::Option<Object<Metadata>> acquires WrapperAccount {
+        let coin_to_fa = &wrapper_account().coin_to_fungible_asset;
+        if (smart_table::contains(coin_to_fa, coin_type_name)) {
+            let data = smart_table::borrow(coin_to_fa, coin_type_name);
+            option::some(data.metadata)
+        } else {
+            option::none()
+        }
+    }
+
+    #[view]
+    public fun view_wrapper_by_components(
+        account_address: address, 
+        module_name: vector<u8>, 
+        struct_name: vector<u8>
+    ): option::Option<Object<Metadata>> acquires WrapperAccount {
+        let addr_str = string_utils::to_string(&account_address);
+        let addr_clean = string::sub_string(&addr_str, 1, string::length(&addr_str));
+        
+        let coin_type_name = addr_clean;
+        string::append(&mut coin_type_name, string::utf8(b"::"));
+        string::append(&mut coin_type_name, string::utf8(module_name));
+        string::append(&mut coin_type_name, string::utf8(b"::"));
+        string::append(&mut coin_type_name, string::utf8(struct_name));
+
+        get_wrapper_by_name_internal(coin_type_name)
     }
 
     #[view]
@@ -95,6 +146,11 @@ module spike_amm::coin_wrapper {
         string::sub_string(&fa_address_str, 1, string::length(&fa_address_str))
     }
 
+    #[view]
+    public fun get_balance<CoinType>(): u64 {
+        coin::balance<CoinType>(wrapper_address())
+    }
+
     public(friend) fun wrap<CoinType>(coins: Coin<CoinType>): FungibleAsset acquires WrapperAccount {
         create_fungible_asset<CoinType>();
 
@@ -140,6 +196,81 @@ module spike_amm::coin_wrapper {
             smart_table::add(&mut wrapper_account.fungible_asset_to_coin, metadata, coin_type);
         };
         smart_table::borrow(coin_to_fungible_asset, coin_type).metadata
+    }
+
+    public(friend) fun get_wrapper_for_type_info(info: type_info::TypeInfo): option::Option<Object<Metadata>> acquires WrapperAccount {
+        let addr_str = string_utils::to_string(&type_info::account_address(&info));
+        let addr_clean = string::sub_string(&addr_str, 1, string::length(&addr_str));
+        
+        let coin_type_name = addr_clean;
+        string::append(&mut coin_type_name, string::utf8(b"::"));
+        string::append(&mut coin_type_name, string::utf8(type_info::module_name(&info)));
+        string::append(&mut coin_type_name, string::utf8(b"::"));
+        string::append(&mut coin_type_name, string::utf8(type_info::struct_name(&info)));
+
+        get_wrapper_by_name_internal(coin_type_name)
+    }
+
+    public fun flash_loan<CoinType>(
+        amount: u64
+    ): (Coin<CoinType>, FlashLoanReceipt<CoinType>) acquires WrapperAccount {
+        let wrapper_acc = wrapper_account();
+        let wrapper_signer = &account::create_signer_with_capability(&wrapper_acc.signer_cap);
+        
+        assert!(coin::balance<CoinType>(wrapper_address()) >= amount, error::invalid_argument(ERROR_INSUFFICIENT_AMOUNT));
+
+        let loan_coins = coin::withdraw<CoinType>(wrapper_signer, amount);
+        let bps = amm_controller::get_flash_loan_fee_bps();
+        let fee = (amount * bps) / 10000;
+
+        let receipt = FlashLoanReceipt { amount, fee };
+
+        event::emit(FlashLoanEvent {
+            amount,
+            fee_amount: fee,
+            coin_type: type_info::type_name<CoinType>()
+        });
+
+        (loan_coins, receipt)
+    }
+
+    public fun repay_flash_loan<CoinType>(
+        repayment: Coin<CoinType>,
+        receipt: FlashLoanReceipt<CoinType>
+    ) {
+        let FlashLoanReceipt { amount, fee } = receipt;
+
+        let repayment_amount = coin::value(&repayment);
+        assert!(repayment_amount >= amount + fee, error::invalid_argument(ERROR_INVALID_REPAYMENT));
+
+        supra_account::deposit_coins(wrapper_address(), repayment);
+    }
+
+    public entry fun collect_accumulated_fees<CoinType>(
+        admin: &signer,
+        amount: u64,
+        to: address
+    ) acquires WrapperAccount {
+        assert!(signer::address_of(admin) == amm_controller::get_admin(), error::permission_denied(ERROR_NOT_ADMIN));
+
+        let wrapper_acc = wrapper_account();
+        let wrapper_signer = &account::create_signer_with_capability(&wrapper_acc.signer_cap);
+        let total_real_balance = coin::balance<CoinType>(wrapper_address());
+        
+        let fa_data = fungible_asset_data<CoinType>();
+        let total_supply_fa = option::destroy_some(fungible_asset::supply(fa_data.metadata));
+
+        let user_collateral = (total_supply_fa as u64);
+        let available_fees = if (total_real_balance > user_collateral) {
+            total_real_balance - user_collateral
+        } else {
+            0
+        };
+
+        assert!(amount <= available_fees, error::invalid_argument(ERROR_INSUFFICIENT_AMOUNT));
+
+        let coins = coin::withdraw<CoinType>(wrapper_signer, amount);
+        coin::deposit(to, coins);
     }
 
     inline fun fungible_asset_data<CoinType>(): &FungibleAssetData acquires WrapperAccount {
