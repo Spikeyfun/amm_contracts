@@ -1,16 +1,22 @@
 module spike_amm::oracle_keepers {
+    use spike_amm::amm_oracle::{Self, Oracle};
+    use supra_framework::object::{Self, Object};
+    use supra_framework::fungible_asset::{Metadata};
+    use std::signer;
 
     public entry fun call_update_by_address(
         _sender: &signer,
-        _tokenA_address: address,
-        _tokenB_address: address
+        tokenA_address: address,
+        tokenB_address: address
     ) {
-        abort 0
+        let tokenA: Object<Metadata> = object::address_to_object<Metadata>(tokenA_address);
+        let tokenB: Object<Metadata> = object::address_to_object<Metadata>(tokenB_address);
+        amm_oracle::update(tokenA, tokenB);
     }
 
     public entry fun call_update_block_info(
         _sender: &signer
     ) {
-        abort 0
+        amm_oracle::update_block_info();
     }
 }
