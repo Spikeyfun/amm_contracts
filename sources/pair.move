@@ -141,9 +141,10 @@ module spike_amm::amm_pair {
       amount: u64
   ): (FungibleAsset, FlashLoanReceipt) acquires Pair {
       amm_controller::assert_unpaused();
-      let lp_data = pair_data(&pair);
+      let lp_data = pair_data_mut(&pair);
       assert!(!lp_data.locked, error::permission_denied(ERROR_LOCKED));
-      
+      lp_data.locked = true; 
+
       let token0 = fungible_asset::store_metadata(lp_data.token0);
       let token1 = fungible_asset::store_metadata(lp_data.token1);
 
@@ -153,7 +154,7 @@ module spike_amm::amm_pair {
       );
 
       let bps = amm_controller::get_flash_loan_fee_bps(); 
-      let fee = (amount * bps) / 10000;
+      let fee = ((((amount as u128) * (bps as u128)) / 10000) as u64);
       
       let store_to_withdraw_from = if (token_to_borrow == token0) {
           lp_data.token0
@@ -187,14 +188,18 @@ module spike_amm::amm_pair {
   ) acquires Pair {
       let FlashLoanReceipt { amount_loaned, fee, token_borrowed } = receipt;
 
+      let lp = pair_data_mut(&pair);
+      assert!(lp.locked, error::invalid_state(ERROR_LOCKED));
+
       let payment_amount = fungible_asset::amount(&payment);
       let required_amount = amount_loaned + fee;
 
       assert!(payment_amount >= required_amount, error::invalid_argument(ERROR_INSUFFICIENT_REPAYMENT));
       assert!(fungible_asset::asset_metadata(&payment) == token_borrowed, error::invalid_argument(ERROR_WRONG_TOKEN));
 
-      let lp = pair_data_mut(&pair);
-      
+      let reserve0 = fungible_asset::balance(lp.token0);
+      let reserve1 = fungible_asset::balance(lp.token1);
+
       let token0 = fungible_asset::store_metadata(lp.token0);
       let store_to_deposit = if (token_borrowed == token0) {
           lp.token0
@@ -207,7 +212,8 @@ module spike_amm::amm_pair {
       let balance0 = fungible_asset::balance(lp.token0);
       let balance1 = fungible_asset::balance(lp.token1);
       
-      update(lp, balance0, balance1, balance0, balance1);
+      update(lp, balance0, balance1, reserve0, reserve1);
+      lp.locked = false;
   }
 
   fun assert_locked(pair: Object<Pair>) acquires Pair {
@@ -277,9 +283,12 @@ module spike_amm::amm_pair {
   #[view]
   public fun balance_of(pair: Object<Pair>, token: Object<Metadata>): u64 acquires Pair {
     let pair_data = pair_data(&pair);
-    if (object::object_address(&token) == object::object_address(&pair_data.token0)) {
+    let token0_meta = fungible_asset::store_metadata(pair_data.token0);
+    let token1_meta = fungible_asset::store_metadata(pair_data.token1);
+
+    if (token == token0_meta) {
       fungible_asset::balance(pair_data.token0)
-    } else if (object::object_address(&token) == object::object_address(&pair_data.token1)) {
+    } else if (token == token1_meta) {
       fungible_asset::balance(pair_data.token1)
     } else {
       0
@@ -573,10 +582,10 @@ module spike_amm::amm_pair {
     amm_controller::assert_unpaused();
     let lp_data = pair_data(&pair);
     assert!(!lp_data.locked, error::permission_denied(ERROR_LOCKED));
-    let amount0_in = fungible_asset::amount(&token0_in);
-    let amount1_in = fungible_asset::amount(&token1_in);
+    let declared_amount0_in = fungible_asset::amount(&token0_in);
+    let declared_amount1_in = fungible_asset::amount(&token1_in);
 
-    assert!(amount0_in > 0 || amount1_in > 0, error::invalid_argument(ERROR_INSUFFICIENT_INPUT_AMOUNT));
+    assert!(declared_amount0_in > 0 || declared_amount1_in > 0, error::invalid_argument(ERROR_INSUFFICIENT_INPUT_AMOUNT));
     assert!(amount0_out > 0 || amount1_out > 0, error::invalid_argument(ERROR_INSUFFICIENT_OUTPUT_AMOUNT));
 
     let lp = pair_data_mut(&pair);
@@ -586,27 +595,48 @@ module spike_amm::amm_pair {
     let reserve0 = fungible_asset::balance(store0);
     let reserve1 = fungible_asset::balance(store1);
 
+    if (declared_amount0_in > 0) {
+        dispatchable_fungible_asset::deposit(store0, token0_in);
+    } else {
+        fungible_asset::destroy_zero(token0_in);
+    };
+
+    if (declared_amount1_in > 0) {
+        dispatchable_fungible_asset::deposit(store1, token1_in);
+    } else {
+        fungible_asset::destroy_zero(token1_in);
+    };
+
     let swap_signer = &amm_controller::get_signer();
 
-    dispatchable_fungible_asset::deposit(store0, token0_in);
-    dispatchable_fungible_asset::deposit(store1, token1_in);
     let token0_out = dispatchable_fungible_asset::withdraw(swap_signer, store0, amount0_out);
     let token1_out = dispatchable_fungible_asset::withdraw(swap_signer, store1, amount1_out);
 
     let balance0 = fungible_asset::balance(store0);
     let balance1 = fungible_asset::balance(store1);
+    let actual_amount0_in = if (balance0 > reserve0 - amount0_out) {
+        balance0 - (reserve0 - amount0_out)
+    } else {
+        0
+    };
+    
+    let actual_amount1_in = if (balance1 > reserve1 - amount1_out) {
+        balance1 - (reserve1 - amount1_out)
+    } else {
+        0
+    };
 
     let swap_fee = amm_controller::get_swap_fee();
 
-    assert_k_increase(balance0, balance1, amount0_in, amount1_in, reserve0, reserve1, swap_fee);
+    assert_k_increase(balance0, balance1, actual_amount0_in, actual_amount1_in, reserve0, reserve1, swap_fee);
     update(lp, balance0, balance1, reserve0, reserve1);
 
     let pair_address = liquidity_pool_address(fungible_asset::store_metadata(lp.token0), fungible_asset::store_metadata(lp.token1));
     
     event::emit(SwapEvent {
       sender: signer::address_of(sender),
-      amount0_in,
-      amount1_in,
+      amount0_in: actual_amount0_in,
+      amount1_in: actual_amount1_in,
       amount0_out,
       amount1_out,
       pair_address: pair_address,
