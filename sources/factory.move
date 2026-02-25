@@ -2,6 +2,7 @@ module spike_amm::amm_factory {
   use std::vector;
   use std::signer;
   use std::error;
+  use std::option;
 
   use aptos_std::smart_vector::{Self, SmartVector};
   use aptos_std::simple_map::{Self, SimpleMap};
@@ -26,6 +27,7 @@ module spike_amm::amm_factory {
   const ERROR_NOT_WHITELISTED: u64 = 3;
   const ERROR_FORBIDDEN: u64 = 4;
   const ERROR_USE_COIN_GATEWAY: u64 = 7;
+  const ERROR_USE_INTERNAL_WRAPPER: u64 = 8;
 
   const ERROR_LAUNCHPAD_NOT_INITIALIZED: u64 = 5;
   const ERROR_LAUNCHPAD_ALREADY_INITIALIZED: u64 = 6;
@@ -62,15 +64,13 @@ module spike_amm::amm_factory {
 
   public fun assert_is_pure_native_fa(token_addr: address) {
     let metadata_obj = supra_framework::object::address_to_object<Metadata>(token_addr);
-    
-    assert!(
-        std::option::is_none(&coin::paired_coin(metadata_obj)),
-        std::error::invalid_argument(ERROR_USE_COIN_GATEWAY)
-    );
 
+    if (coin_wrapper::is_wrapper(metadata_obj)) {
+        return
+    };
     assert!(
-        !coin_wrapper::is_wrapper(metadata_obj),
-        std::error::invalid_argument(ERROR_USE_COIN_GATEWAY)
+        option::is_none(&coin::paired_coin(metadata_obj)),
+        error::invalid_argument(ERROR_USE_COIN_GATEWAY)
     );
   }
 
@@ -90,6 +90,8 @@ module spike_amm::amm_factory {
     tokenA: address,
     tokenB: address,
   ) acquires Factory {
+    assert_is_pure_native_fa(tokenA);
+    assert_is_pure_native_fa(tokenB);
     create_pair_internal(sender, tokenA, tokenB);
   }
 

@@ -19,24 +19,50 @@ module spike_amm::amm_router {
     const ERROR_EXPIRED: u64 = 1;
     const ERROR_INSUFFICIENT_INPUT_AMOUNT: u64 = 2;
     const ERROR_INSUFFICIENT_OUTPUT_AMOUNT: u64 = 3;
-    const ERROR_INVALID_PATH: u64 = 4;
-    const ERROR_INSUFFICIENT_BALANCE: u64 = 5;
-    const ERROR_INVALID_TOKEN_ORDER: u64 = 6;
-    const ERROR_INVALID_AMOUNT: u64 = 7;
-    const ERROR_INVALID_PATH_LENGTH: u64 = 8;
-    const ERROR_IDENTICAL_TOKENS: u64 = 9;
-    const ERROR_INSUFFICIENT_AMOUNT: u64 = 10;
-    const ERROR_INSUFFICIENT_A_AMOUNT: u64 = 11;
-    const ERROR_INSUFFICIENT_B_AMOUNT: u64 = 12;
-    const ERROR_INTERNAL_ERROR: u64 = 13;
-    const ERROR_ZERO_AMOUNT: u64 = 14;
-    const ERROR_BWSUP_AS_OUTPUT_NOT_ALLOWED: u64 = 15;
-    const ERROR_TOKEN_B_MUST_BE_BWSUP: u64 = 16;
-    const ERROR_USE_COIN_FUNCTION: u64 = 17;
-    const ERROR_USE_BWSUP_INSTEAD: u64 = 18;
+    const ERROR_EXCESSIVE_INPUT_AMOUNT: u64 = 4;
+    const ERROR_INVALID_PATH: u64 = 5;
+    const ERROR_INSUFFICIENT_BALANCE: u64 = 6;
+    const ERROR_INVALID_TOKEN_ORDER: u64 = 7;
+    const ERROR_INVALID_AMOUNT: u64 = 8;
+    const ERROR_INVALID_PATH_LENGTH: u64 = 9;
+    const ERROR_IDENTICAL_TOKENS: u64 = 10;
+    const ERROR_INSUFFICIENT_AMOUNT: u64 = 11;
+    const ERROR_INSUFFICIENT_A_AMOUNT: u64 = 12;
+    const ERROR_INSUFFICIENT_B_AMOUNT: u64 = 13;
+    const ERROR_INTERNAL_ERROR: u64 = 14;
+    const ERROR_ZERO_AMOUNT: u64 = 15;
+    const ERROR_BWSUP_AS_OUTPUT_NOT_ALLOWED: u64 = 16;
+    const ERROR_TOKEN_B_MUST_BE_BWSUP: u64 = 17;
+    const ERROR_USE_COIN_FUNCTION: u64 = 18;
+    const ERROR_USE_BWSUP_INSTEAD: u64 = 19;
+    const ERROR_INVALID_TOKEN_ADDRESS: u64 = 20;
 
     const WSUP: address = @0xa;
     const MIN_PATH_LENGTH: u64 = 2;
+
+    fun get_canonical_address(addr: address): address {
+        if (addr == WSUP) {
+            return get_address_BWSUP()
+        };
+        
+        if (object::object_exists<Metadata>(addr)) {
+            let metadata = object::address_to_object<Metadata>(addr);
+            if (coin_wrapper::is_wrapper(metadata)) {
+                return addr
+            };
+
+            let paired_coin_opt = supra_framework::coin::paired_coin(metadata);
+            if (option::is_some(&paired_coin_opt)) {
+                let coin_info = option::destroy_some(paired_coin_opt);
+                let my_wrapper_opt = coin_wrapper::get_wrapper_for_type_info(coin_info);
+                if (option::is_some(&my_wrapper_opt)) {
+                    return object::object_address(&option::destroy_some(my_wrapper_opt))
+                };
+            };
+            return addr
+        };
+        abort error::invalid_argument(ERROR_INVALID_TOKEN_ADDRESS)
+    }
 
     fun calc_optimal_coin_values(
         token_a: Object<Metadata>,
@@ -72,7 +98,7 @@ module spike_amm::amm_router {
                 let amount_a_optimal = utils::quote(amount_b_desired, reserve_b, reserve_a);
                 assert!(
                     amount_a_optimal <= amount_a_desired,
-                    error::internal(ERROR_INTERNAL_ERROR)
+                    error::invalid_argument(ERROR_INTERNAL_ERROR)
                 );
                 assert!(
                     amount_a_optimal >= amount_aMin,
@@ -124,7 +150,7 @@ module spike_amm::amm_router {
 
         if (expected == bwsup_addr) {
             assert!(
-                actual_start == bwsup_addr || actual_start == @0xa,
+                actual_start == bwsup_addr || actual_start == WSUP,
                 error::invalid_argument(ERROR_INVALID_PATH)
             );
         } else {
@@ -147,7 +173,7 @@ module spike_amm::amm_router {
 
         if (expected == bwsup_addr) {
             assert!(
-                actual_last == bwsup_addr || actual_last == @0xa,
+                actual_last == bwsup_addr || actual_last == WSUP,
                 error::invalid_argument(ERROR_INVALID_PATH)
             );
         } else {
@@ -167,25 +193,27 @@ module spike_amm::amm_router {
         let len = vector::length(&path);
         while (i < len) {
             let addr = vector::borrow_mut(&mut path, i);
-
-            if (object::object_exists<Metadata>(*addr)) {
-                let metadata = object::address_to_object<Metadata>(*addr);
-                
-                let paired_coin_opt = supra_framework::coin::paired_coin(metadata);
-                
-                if (option::is_some(&paired_coin_opt)) {
-                    let coin_info = option::destroy_some(paired_coin_opt);
-                    
-                    let my_wrapper_opt = coin_wrapper::get_wrapper_for_type_info(coin_info);
-                    
-                    if (option::is_some(&my_wrapper_opt)) {
-                        *addr = object::object_address(&option::destroy_some(my_wrapper_opt));
-                    };
-                };
-            };
+            *addr = get_canonical_address(*addr);
             i = i + 1;
         };
         path
+    }
+
+    fun smart_inject_path_start<CoinType>(path: &mut vector<address>) {
+        let coin_object = coin_wrapper::create_fungible_asset<CoinType>();
+        let expected_start = object::object_address(&coin_object);
+        if (vector::is_empty(path) || *vector::borrow(path, 0) != expected_start) {
+            vector::insert(path, 0, expected_start);
+        };
+    }
+
+    fun smart_inject_path_end<CoinType>(path: &mut vector<address>) {
+        let coin_object = coin_wrapper::create_fungible_asset<CoinType>();
+        let expected_end = object::object_address(&coin_object);
+        let len = vector::length(path);
+        if (len == 0 || *vector::borrow(path, len - 1) != expected_end) {
+            vector::push_back(path, expected_end);
+        };
     }
     
     fun smart_withdraw(sender: &signer, token_obj: Object<Metadata>, amount: u64): FungibleAsset {
@@ -279,14 +307,7 @@ module spike_amm::amm_router {
         let coin_object = coin_wrapper::get_wrapper<CoinType>();
         let bwsup = primary_fungible_store::withdraw(sender, coin_object, amount);
         let original_coin = coin_wrapper::unwrap<CoinType>(bwsup);
-        let sender_addr = signer::address_of(sender);
-        if (!coin::is_account_registered<CoinType>(sender_addr)) {
-            coin::register<CoinType>(sender);
-        };
-        coin::deposit<CoinType>(sender_addr, original_coin);
-        if (sender_addr != to) {
-            supra_account::transfer_coins<CoinType>(sender, to, amount);
-        };
+        supra_account::deposit_coins(to, original_coin);
     }
 
     public fun create_locked_pair_for_launchpad(
@@ -337,8 +358,8 @@ module spike_amm::amm_router {
             amount1Min
         );
 
-        let asset0 = primary_fungible_store::withdraw(sender, token0, amount0Optimal);
-        let asset1 = primary_fungible_store::withdraw(sender, token1, amount1Optimal);
+        let asset0 = smart_withdraw(sender, token0, amount0Optimal);
+        let asset1 = smart_withdraw(sender, token1, amount1Optimal);
 
         let (lp_amount, lp_token_metadata) = amm_pair::mint(sender, asset0, asset1, to);
 
@@ -359,6 +380,7 @@ module spike_amm::amm_router {
         to: address,
         deadline: u64
     ): (u64, u64, u64, Object<Metadata>) {
+        let token = get_canonical_address(token);
         let bwsup_address = get_address_BWSUP();
         let pair_address = amm_factory::get_pair(token, bwsup_address);
         assert!(pair_address != @0x0, error::invalid_argument(ERROR_INVALID_PATH));
@@ -436,11 +458,29 @@ module spike_amm::amm_router {
         deadline: u64
     ): (u64, u64, u64, Object<Metadata>) {
         ensure(deadline); 
-        assert!(tokenA != @0xa && tokenB != @0xa, error::invalid_argument(ERROR_USE_BWSUP_INSTEAD));
+        let tokenA = get_canonical_address(tokenA);
+        let tokenB = get_canonical_address(tokenB);
+
+        assert!(tokenA != WSUP && tokenB != WSUP, error::invalid_argument(ERROR_USE_BWSUP_INSTEAD));
         validate_token_pair(tokenA, tokenB);
         validate_amount(amountADesired);
         validate_amount(amountBDesired);
 
+        let metaA = object::address_to_object<Metadata>(tokenA);
+        let metaB = object::address_to_object<Metadata>(tokenB);
+        if (!coin_wrapper::is_wrapper(metaA)) {
+            assert!(
+                option::is_none(&supra_framework::coin::paired_coin(metaA)),
+                error::invalid_argument(ERROR_USE_COIN_FUNCTION)
+            );
+        };
+        if (!coin_wrapper::is_wrapper(metaB)) {
+            assert!(
+                option::is_none(&supra_framework::coin::paired_coin(metaB)),
+                error::invalid_argument(ERROR_USE_COIN_FUNCTION)
+            );
+        };
+        
         assert_is_pure_native_fa(tokenA);
         assert_is_pure_native_fa(tokenB);
 
@@ -494,12 +534,13 @@ module spike_amm::amm_router {
         deadline: u64
     ): (u64, u64, u64, Object<Metadata>) {
         ensure(deadline);
+        let token = get_canonical_address(token);
+
         validate_token_pair(token, WSUP);
         assert_is_pure_native_fa(token);
         validate_amount(amount_token_desired);
         validate_amount(amount_supra_desired);
         
-        let sender_addr = signer::address_of(sender);
         let token_object = object::address_to_object<Metadata>(token);
         let supra_object = coin_wrapper::get_wrapper<SupraCoin>(); 
         let supra_addr = object::object_address(&supra_object);
@@ -531,21 +572,15 @@ module spike_amm::amm_router {
             amount1_min,
         );
 
-        let supra_object_balance = primary_fungible_store::balance(sender_addr, supra_object);
-        if (supra_object_balance < (if (token0 == supra_object) { amount0 } else { amount1 })) {
-            let amount_supra_to_deposit = (if (token0 == supra_object) { amount0 } else { amount1 }) - supra_object_balance;
-            wrap_beta<SupraCoin>(sender, sender_addr, amount_supra_to_deposit); 
-        };
-
         let (asset0, asset1) = if (token0 == token_object) {
             (
-                primary_fungible_store::withdraw(sender, token_object, amount0),
-                primary_fungible_store::withdraw(sender, supra_object, amount1)
+                smart_withdraw(sender, token_object, amount0),
+                smart_withdraw(sender, supra_object, amount1)
             )
         } else {
             (
-                primary_fungible_store::withdraw(sender, supra_object, amount0),
-                primary_fungible_store::withdraw(sender, token_object, amount1)
+                smart_withdraw(sender, supra_object, amount0),
+                smart_withdraw(sender, token_object, amount1)
             )
         };
 
@@ -590,82 +625,16 @@ module spike_amm::amm_router {
         to: address,
         deadline: u64
     ): (u64, u64, u64, Object<Metadata>) {
-        ensure(deadline); 
-        let sender_addr = signer::address_of(sender);
-        assert_is_pure_native_fa(token);
-        
-        let token_object = object::address_to_object<Metadata>(token);
-
-        let is_supra = aptos_std::type_info::type_of<CoinType>() == aptos_std::type_info::type_of<SupraCoin>();
-        
-        let coin_object = if (is_supra) {
-            coin_wrapper::get_wrapper<SupraCoin>()
-        } else {
-            option::destroy_some(coin::paired_metadata<CoinType>())
-        };
-        
-        let coin_addr = object::object_address(&coin_object);
-        // ---------------------------------------
-
-        let (token0, token1) = sort::sort_two_tokens(token_object, coin_object);
-
-        if (!amm_factory::pair_exists(token0, token1)) {
-            amm_factory::create_pair_from_router(sender, token, coin_addr);
-        };
-
-        let (amount0_desired, amount1_desired) = if (token0 == token_object) {
-            (amount_token_desired, amount_coin_desired)
-        } else {
-            (amount_coin_desired, amount_token_desired)
-        };
-        
-        let (amount0_min, amount1_min) = if (token0 == token_object) {
-            (amount_token_min, amount_coin_min)
-        } else {
-            (amount_coin_min, amount_token_min)
-        };
-
-        let (amount0, amount1) = calc_optimal_coin_values(
-            token0,
-            token1,
-            amount0_desired,
-            amount1_desired,
-            amount0_min,
-            amount1_min,
-        );
-
-        let coin_object_balance = primary_fungible_store::balance(sender_addr, coin_object);
-        if (coin_object_balance < (if (token0 == coin_object) { amount0 } else { amount1 })) {
-            let amount_coin_to_deposit = (if (token0 == coin_object) { amount0 } else { amount1 }) - coin_object_balance;
-            
-            if (is_supra) {
-                wrap_beta<SupraCoin>(sender, sender_addr, amount_coin_to_deposit);
-            } else {
-                wrap_coin<CoinType>(sender, amount_coin_to_deposit);
-            };
-        };
-
-        let (asset0, asset1) = if (token0 == token_object) {
-            (
-                primary_fungible_store::withdraw(sender, token_object, amount0),
-                primary_fungible_store::withdraw(sender, coin_object, amount1)
-            )
-        } else {
-            (
-                primary_fungible_store::withdraw(sender, coin_object, amount0),
-                primary_fungible_store::withdraw(sender, token_object, amount1)
-            )
-        };
-
-        let (lp_amount, lp_token_metadata) = amm_pair::mint(sender, asset0, asset1, to);
-        
-        let (amount_token_added, amount_coin_added) = if (token0 == token_object) {
-            (amount0, amount1)
-        } else {
-            (amount1, amount0)
-        };
-        
-        (amount_token_added, amount_coin_added, lp_amount, lp_token_metadata)
+        add_liquidity_coin_aux_beta<CoinType>(
+            sender, 
+            token, 
+            amount_token_desired, 
+            amount_token_min, 
+            amount_coin_desired, 
+            amount_coin_min, 
+            to,
+            deadline
+        )
     }
 
     public entry fun add_liquidity_coin_beta<CoinType>(
@@ -701,6 +670,8 @@ module spike_amm::amm_router {
         deadline: u64
     ) : (u64, u64, u64, Object<Metadata>) {
         ensure(deadline);
+        let token = get_canonical_address(token);
+
         let sender_addr = signer::address_of(sender);
         assert_is_pure_native_fa(token);
         let tokenA_object = object::address_to_object<Metadata>(token);
@@ -871,23 +842,20 @@ module spike_amm::amm_router {
         );
         
         let pair = amm_pair::liquidity_pool(tokenA, tokenB);
-
-        let (reserve_a, reserve_b, _) = amm_pair::get_reserves(pair);
-        let total_supply = amm_pair::lp_token_supply(pair);
-        let expected_a = (liquidity as u128) * (reserve_a as u128) / (total_supply as u128);
-        let expected_b = (liquidity as u128) * (reserve_b as u128) / (total_supply as u128);
-        
-        assert!(
-            (expected_a as u64) >= amountAMin && (expected_b as u64) >= amountBMin,
-            error::invalid_state(ERROR_INSUFFICIENT_OUTPUT_AMOUNT)
-        );
         let (redeemedA, redeemedB) = amm_pair::burn(sender, pair, liquidity);
 
-        if (sort::is_sorted_two(tokenA, tokenB)) {
+        let (ret_a, ret_b) = if (sort::is_sorted_two(tokenA, tokenB)) {
             (redeemedA, redeemedB)
         } else {
             (redeemedB, redeemedA)
-        }
+        };
+
+        assert!(
+            fungible_asset::amount(&ret_a) >= amountAMin && fungible_asset::amount(&ret_b) >= amountBMin,
+            error::invalid_state(ERROR_INSUFFICIENT_OUTPUT_AMOUNT)
+        );
+
+        (ret_a, ret_b)
     }
 
     public entry fun remove_liquidity(
@@ -901,6 +869,8 @@ module spike_amm::amm_router {
         deadline: u64
     ) {
         let bwsup_address = get_address_BWSUP();
+        let tokenA = get_canonical_address(tokenA);
+        let tokenB = get_canonical_address(tokenB);
         assert!(
             tokenA != bwsup_address && tokenB != bwsup_address,
             error::invalid_argument(ERROR_BWSUP_AS_OUTPUT_NOT_ALLOWED)
@@ -929,6 +899,10 @@ module spike_amm::amm_router {
         deadline: u64
     ): (u64, u64) {
         ensure(deadline);
+
+        let tokenA = get_canonical_address(tokenA);
+        let tokenB = get_canonical_address(tokenB);
+
         let tokenA_object = object::address_to_object<Metadata>(tokenA);
         let tokenB_object = object::address_to_object<Metadata>(tokenB);
         
@@ -989,6 +963,9 @@ module spike_amm::amm_router {
         deadline: u64
     ): (u64, u64) {
         ensure(deadline);
+
+        let token = get_canonical_address(token);
+
         let token_object = object::address_to_object<Metadata>(token);
         let supra_object = coin_wrapper::get_wrapper<SupraCoin>();
 
@@ -1004,25 +981,11 @@ module spike_amm::amm_router {
         let amountA = fungible_asset::amount(&asset_token);
         let amountB = fungible_asset::amount(&asset_supra);
 
-        assert!(
-            amountA >= amount_token_min,
-            error::invalid_state(ERROR_INSUFFICIENT_OUTPUT_AMOUNT)
-        );
-        assert!(
-            amountB >= amount_supra_min,
-            error::invalid_state(ERROR_INSUFFICIENT_OUTPUT_AMOUNT)
-        );
-
-        primary_fungible_store::deposit(to, asset_token);
+        smart_deposit(to, asset_token);
 
         let supra_legacy_coin = coin_wrapper::unwrap<SupraCoin>(asset_supra);
         
-        let sender_addr = signer::address_of(sender);
-        if (to == sender_addr && !coin::is_account_registered<SupraCoin>(to)) {
-            coin::register<SupraCoin>(sender);
-        };
-        
-        coin::deposit(to, supra_legacy_coin);
+        supra_account::deposit_coins(to, supra_legacy_coin);
 
         (amountA, amountB)
     }
@@ -1050,6 +1013,8 @@ module spike_amm::amm_router {
         amount_token_min: u64,
         amount_coin_min: u64,
     ): (u64, u64) {
+        let token = get_canonical_address(token);
+
         let token_object = object::address_to_object<Metadata>(token);
         let coin_object = coin_wrapper::get_wrapper<CoinType>();
 
@@ -1075,15 +1040,9 @@ module spike_amm::amm_router {
         ); 
 
         let to = signer::address_of(sender);
-
         primary_fungible_store::deposit(to, asset_token);
-
         let legacy_coin = coin_wrapper::unwrap<CoinType>(asset_coin);
-        if (!coin::is_account_registered<CoinType>(to)) {
-            coin::register<CoinType>(sender);
-        };
-
-        coin::deposit(to, legacy_coin);
+        supra_account::deposit_coins(to, legacy_coin);
 
         (amountA, amountB)
     }
@@ -1252,11 +1211,8 @@ module spike_amm::amm_router {
         let path = normalize_path(path);
         let sender_addr = signer::address_of(sender);
 
-        let coin_object = coin_wrapper::get_wrapper<CoinType>();
-        let expected_start_address = object::object_address(&coin_object);
-
-        validate_path_start(&path, expected_start_address);
-
+        smart_inject_path_start<CoinType>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
         wrap_beta<CoinType>(sender, sender_addr, amount_coin);
 
         swap_exact_input_internal(sender, amount_coin, amount_out_min, path, to);
@@ -1286,10 +1242,10 @@ module spike_amm::amm_router {
         amount_out: u64
     ): u64 {
         let path_len = vector::length(&path);
+        assert!(path_len >= 2, error::invalid_argument(ERROR_INVALID_PATH));
+
         let i = path_len - 1;
         let current_target_amount = amount_out;
-        let amounts = vector::empty<u64>();
-        vector::push_back(&mut amounts, amount_out);
 
         while (i > 0) {
             let from_token_obj = object::address_to_object<Metadata>(*vector::borrow(&path, i - 1));
@@ -1305,17 +1261,14 @@ module spike_amm::amm_router {
                 (r1, r0)
             };
 
-            let amount_needed_as_input = utils::get_amount_in(
+            current_target_amount = utils::get_amount_in(
                 current_target_amount,
                 reserve_of_from_token,
                 reserve_of_to_token
             );
-            vector::push_back(&mut amounts, amount_needed_as_input);
-            current_target_amount = amount_needed_as_input;
             i = i - 1;
         };
-        vector::reverse(&mut amounts);
-        *vector::borrow(&amounts, 0)
+        current_target_amount
     }
 
     fun swap_for_exact_output_internal(
@@ -1326,9 +1279,11 @@ module spike_amm::amm_router {
         to: address
     ) {
         let path_len = vector::length(&path);
+        assert!(path_len >= 2, error::invalid_argument(ERROR_INVALID_PATH));
         let sender_addr = signer::address_of(sender);
 
         let initial_token_obj = object::address_to_object<Metadata>(*vector::borrow(&path, 0));
+
         let current_processing_asset = smart_withdraw(
             sender,
             initial_token_obj,
@@ -1351,8 +1306,9 @@ module spike_amm::amm_router {
             i = i + 1;
         };
         let final_amount_obtained = fungible_asset::amount(&current_processing_asset);
+        let tolerance = (path_len - 1); 
         assert!(
-            final_amount_obtained >= amount_out_expected,
+            final_amount_obtained + tolerance >= amount_out_expected,
             error::invalid_state(ERROR_INSUFFICIENT_OUTPUT_AMOUNT)
         );
 
@@ -1370,10 +1326,8 @@ module spike_amm::amm_router {
         ensure(deadline);        
         let path = normalize_path(path);
 
-        let coin_object = coin_wrapper::get_wrapper<CoinType>();
-        let expected_start_address = object::object_address(&coin_object);
-        validate_path_start(&path, expected_start_address);
-
+        smart_inject_path_start<CoinType>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
         let sender_addr = signer::address_of(sender);
 
         let total_amount_in_calculated = calculate_amount_in_for_exact_out(path, amount_out);
@@ -1409,12 +1363,16 @@ module spike_amm::amm_router {
         ensure(deadline);
         
         let path = normalize_path(path);
-        let path_len = vector::length(&path);
-        assert!(path_len >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
-
         let bwsup_addr = get_address_BWSUP();
-        validate_path_start(&path, bwsup_addr);
         
+        if (vector::is_empty(&path) || *vector::borrow(&path, 0) != bwsup_addr) {
+            vector::insert(&mut path, 0, bwsup_addr);
+        };
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
+
+        let final_length = vector::length(&path);
+        assert!(final_length >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
+
         let sender_addr = signer::address_of(sender);
 
         let supra_needed = calculate_amount_in_for_exact_out(path, amount_out);
@@ -1424,7 +1382,7 @@ module spike_amm::amm_router {
         let current_processing_asset = smart_withdraw(sender, bwsup_metadata, supra_needed);
 
         let i = 0u64;
-        while (i < path_len - 1) {
+        while (i < final_length  - 1) {
             let next_token_metadata = object::address_to_object<Metadata>(
                 *vector::borrow(&path, i + 1)
             );
@@ -1478,11 +1436,15 @@ module spike_amm::amm_router {
     ): FungibleAsset {
         ensure(deadline);
         
-        let path = normalize_path(path);
-        let length = vector::length(&path);
-        
+        let path = normalize_path(path);        
         let bwsup_addr = get_address_BWSUP();
-        validate_path_start(&path, bwsup_addr);
+
+        if (vector::is_empty(&path) || *vector::borrow(&path, 0) != bwsup_addr) {
+            vector::insert(&mut path, 0, bwsup_addr);
+        };
+
+        let final_length = vector::length(&path);
+        assert!(final_length >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
         
         let sender_addr = signer::address_of(sender);
         
@@ -1490,10 +1452,10 @@ module spike_amm::amm_router {
         let current_processing_asset = smart_withdraw(sender, bwsup_metadata, amount_supra);
         
         let i = 0u64;
-        while (i < length - 1) {
+        while (i < final_length  - 1) {
             let next_token_metadata = object::address_to_object<Metadata>(
                 *vector::borrow(&path, i + 1)
-            );
+            );  
             
             current_processing_asset = swap(
                 sender,
@@ -1551,15 +1513,18 @@ module spike_amm::amm_router {
         is_wsup: bool,
     ): FungibleAsset {
         ensure(deadline);
-
         let path = normalize_path(path); 
 
-        let path_len = vector::length(&path);
-        assert!(path_len >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
-
         let bwsup_address = get_address_BWSUP();
-        validate_path_end(&path, bwsup_address);
+        let path_len = vector::length(&path);
 
+        if (path_len == 0 || *vector::borrow(&path, path_len - 1) != bwsup_address) {
+            vector::push_back(&mut path, bwsup_address);
+        };
+
+        let final_length = vector::length(&path);
+        assert!(final_length >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
+        
         if (!is_wsup) {
             ensure_path_does_not_start_with(&path, bwsup_address);
         };
@@ -1580,7 +1545,7 @@ module spike_amm::amm_router {
         );
 
         let i = 0u64;
-        while (i < path_len - 1) {
+        while (i < final_length - 1) {
             let next_token_in_path_metadata = object::address_to_object<Metadata>(
                 *vector::borrow(&path, i + 1)
             );
@@ -1654,12 +1619,17 @@ module spike_amm::amm_router {
         is_wsup: bool,
     ): FungibleAsset {
         ensure(deadline);
-        
         let path = normalize_path(path);
-        let length = vector::length(&path);
-        
+
         let bwsup_address = get_address_BWSUP();
-        validate_path_end(&path, bwsup_address);
+        let path_len = vector::length(&path);
+
+        if (path_len == 0 || *vector::borrow(&path, path_len - 1) != bwsup_address) {
+            vector::push_back(&mut path, bwsup_address);
+        };
+
+        let final_length = vector::length(&path);
+        assert!(final_length >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
 
         if (!is_wsup) {
             ensure_path_does_not_start_with(&path, bwsup_address);
@@ -1675,7 +1645,7 @@ module spike_amm::amm_router {
         );
 
         let i = 0u64;
-        while (i < length - 1) {
+        while (i < final_length - 1) {
             let next_token_in_path_metadata = object::address_to_object<Metadata>(
                 *vector::borrow(&path, i + 1)
             );
@@ -1730,26 +1700,9 @@ module spike_amm::amm_router {
         let path = normalize_path(path); 
         let sender_addr = signer::address_of(sender);
 
-        let is_amm_wrapped = coin_wrapper::is_supported<CoinType>();
-
-        let expected_start = if (is_amm_wrapped) {
-            object::object_address(&coin_wrapper::get_wrapper<CoinType>())
-        } else {
-            let network_metadata = option::destroy_some(coin::paired_metadata<CoinType>());
-            object::object_address(&network_metadata)
-        };
-        
-        validate_path_start(&path, expected_start);
-
-        if (is_amm_wrapped) {
-            wrap_beta<CoinType>(sender, sender_addr, amount_coin);
-        } else {
-            let network_metadata = option::destroy_some(coin::paired_metadata<CoinType>());
-            let current_fa_balance = primary_fungible_store::balance(sender_addr, network_metadata);
-            if (current_fa_balance < amount_coin) {
-                wrap_coin<CoinType>(sender, amount_coin - current_fa_balance);
-            };
-        };
+        smart_inject_path_start<CoinType>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
+        wrap_beta<CoinType>(sender, sender_addr, amount_coin);
 
         swap_exact_input_internal(sender, amount_coin, amount_out_min, path, to);
     }
@@ -1766,31 +1719,16 @@ module spike_amm::amm_router {
         let path = normalize_path(path); 
         let sender_addr = signer::address_of(sender);
 
-        let is_amm_wrapped = coin_wrapper::is_supported<CoinType>();
-
-        let expected_start = if (is_amm_wrapped) {
-            object::object_address(&coin_wrapper::get_wrapper<CoinType>())
-        } else {
-            let metadata = option::destroy_some(coin::paired_metadata<CoinType>());
-            object::object_address(&metadata)
-        };
-        validate_path_start(&path, expected_start);
-
+        smart_inject_path_start<CoinType>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
         let total_amount_in_calculated = calculate_amount_in_for_exact_out(path, amount_out);
+
         assert!(
             total_amount_in_calculated <= amount_coin_max,
             error::invalid_state(ERROR_INSUFFICIENT_INPUT_AMOUNT)
         );
 
-        if (is_amm_wrapped) {
-            wrap_beta<CoinType>(sender, sender_addr, total_amount_in_calculated);
-        } else {
-            let network_metadata = option::destroy_some(coin::paired_metadata<CoinType>());
-            let current_fa_balance = primary_fungible_store::balance(sender_addr, network_metadata);
-            if (current_fa_balance < total_amount_in_calculated) {
-                wrap_coin<CoinType>(sender, total_amount_in_calculated - current_fa_balance);
-            };
-        };
+        wrap_beta<CoinType>(sender, sender_addr, total_amount_in_calculated);
 
         swap_for_exact_output_internal(sender, total_amount_in_calculated, amount_out, path, to);
     }
@@ -1804,17 +1742,14 @@ module spike_amm::amm_router {
         deadline: u64,
     ) {
         ensure(deadline);
+        let path = normalize_path(path); 
         let sender_addr = signer::address_of(sender);
-        
-        let path_len = vector::length(&path);
-        assert!(path_len >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
+
+        smart_inject_path_end<CoinType>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
 
         let bwsup_address = get_address_BWSUP();
         ensure_path_does_not_start_with(&path, bwsup_address);
-
-        let coin_object = coin_wrapper::get_wrapper<CoinType>();
-        let expected_last_address = object::object_address(&coin_object);
-        validate_path_end(&path, expected_last_address);
 
         let amount_out_wrapped_coin = swap_exact_input_internal(
             sender,
@@ -1839,15 +1774,11 @@ module spike_amm::amm_router {
         let path = normalize_path(path);
         let sender_addr = signer::address_of(sender);
 
-        let coin_object_A = coin_wrapper::get_wrapper<CoinType_A>();
-        let a_addr = object::object_address(&coin_object_A);
-        validate_path_start(&path, a_addr);
-
-        let coin_object_B = coin_wrapper::get_wrapper<CoinType_B>();
-        let b_addr = object::object_address(&coin_object_B);
-        validate_path_end(&path, b_addr);
-
-        let is_b_supra = (b_addr == get_address_BWSUP());
+        smart_inject_path_start<CoinType_A>(&mut path);
+        smart_inject_path_end<CoinType_B>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
+        let baddr = *vector::borrow(&path, vector::length(&path) - 1);
+        let is_b_supra = (baddr == get_address_BWSUP());
 
         wrap_beta<CoinType_A>(sender, sender_addr, amount_in_coin);
 
@@ -1884,14 +1815,11 @@ module spike_amm::amm_router {
         let path = normalize_path(path);
         let sender_addr = signer::address_of(sender);
 
-        let coin_object_A = coin_wrapper::get_wrapper<CoinType_A>();
-        let a_addr = object::object_address(&coin_object_A);
-        validate_path_start(&path, a_addr);
+        smart_inject_path_start<CoinType_A>(&mut path);
+        smart_inject_path_end<CoinType_B>(&mut path);
+        assert!(vector::length(&path) >= MIN_PATH_LENGTH, error::invalid_argument(ERROR_INVALID_PATH_LENGTH));
 
-        let coin_object_B = coin_wrapper::get_wrapper<CoinType_B>();
-        let b_addr = object::object_address(&coin_object_B);
-        validate_path_end(&path, b_addr);
-
+        let b_addr = *vector::borrow(&path, vector::length(&path) - 1);
         let is_b_supra = (b_addr == get_address_BWSUP());
 
         let total_amount_in_calculated = calculate_amount_in_for_exact_out(path, amount_out_coin);
@@ -2016,23 +1944,15 @@ module spike_amm::amm_router {
     }
 
     fun normalize_metadata(token: Object<Metadata>): Object<Metadata> {
-        let paired_coin_opt = supra_framework::coin::paired_coin(token);
-        
-        if (option::is_some(&paired_coin_opt)) {
-            let coin_info = option::destroy_some(paired_coin_opt);
-            let my_wrapper_opt = coin_wrapper::get_wrapper_for_type_info(coin_info);
-            
-            if (option::is_some(&my_wrapper_opt)) {
-                return option::destroy_some(my_wrapper_opt)
-            };
-        };
-        token
+        let token_addr = object::object_address(&token);
+        let canonical_addr = get_canonical_address(token_addr);
+        object::address_to_object<Metadata>(canonical_addr)
     }
 
     #[view]
     public fun get_amounts_in(
         amount_out: u64,
-        path: vector<Object<Metadata>>, // <--- SE MANTIENE EL TIPO ORIGINAL
+        path: vector<Object<Metadata>>,
     ): vector<u64> {
         assert!(
             vector::length(&path) >= 2,
